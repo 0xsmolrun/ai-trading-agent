@@ -5,6 +5,8 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from src.agent.decision_maker import TradingAgent
 from src.indicators.taapi_client import TAAPIClient
 from src.trading.hyperliquid_api import HyperliquidAPI
+from src.trading.lighter_api import LighterAPI
+from src.strategies.market_making import MarketMakingStrategy
 import time
 import asyncio
 import logging
@@ -58,10 +60,22 @@ def main():
         parser.error("Please provide --assets and --interval, or set ASSETS and INTERVAL in .env")
 
     taapi = TAAPIClient()
-    hyperliquid = HyperliquidAPI()
+
+    # Initialize DEX client based on configuration
+    selected_dex = CONFIG.get("dex", "hyperliquid").lower()
+    if selected_dex == "lighter":
+        dex_api = LighterAPI()
+        logging.info("Using Lighter DEX on Arbitrum")
+    else:
+        dex_api = HyperliquidAPI()
+        logging.info("Using Hyperliquid DEX")
+
+    # Keep hyperliquid variable for backward compatibility
+    hyperliquid = dex_api
+
     agent = TradingAgent()
 
-    # Initialize strategy if enabled
+    # Initialize Trader XO strategy if enabled
     strategy_integration = None
     use_strategy = CONFIG.get("use_strategy", False)
     if use_strategy:
@@ -81,6 +95,26 @@ def main():
         )
         strategy_mode = CONFIG.get("strategy_mode", "standalone")
         logging.info(f"Strategy enabled: {CONFIG.get('strategy_name')} in {strategy_mode} mode")
+
+    # Initialize Market Making strategy if enabled (for Lighter)
+    mm_strategy = None
+    use_market_making = CONFIG.get("lighter_use_market_making", False)
+    if use_market_making and selected_dex == "lighter":
+        mm_strategy = MarketMakingStrategy(
+            spread_bps=CONFIG.get("mm_spread_bps", 10),
+            order_size_usd=CONFIG.get("mm_order_size_usd", 100.0),
+            num_levels=CONFIG.get("mm_num_levels", 3),
+            level_spacing_bps=CONFIG.get("mm_level_spacing_bps", 5),
+            refresh_interval_sec=CONFIG.get("mm_refresh_interval_sec", 30),
+            skew_on_signal=use_strategy,  # Skew if Trader XO is enabled
+            skew_amount=0.3
+        )
+        logging.info(f"Market Making enabled: spread={CONFIG.get('mm_spread_bps')}bps, "
+                    f"levels={CONFIG.get('mm_num_levels')}")
+
+    print(f"DEX: {selected_dex.upper()}")
+    print(f"Trader XO Strategy: {'Enabled' if use_strategy else 'Disabled'}")
+    print(f"Market Making: {'Enabled' if use_market_making else 'Disabled'}")
 
 
     start_time = datetime.now(timezone.utc)
