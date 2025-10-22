@@ -61,6 +61,27 @@ def main():
     hyperliquid = HyperliquidAPI()
     agent = TradingAgent()
 
+    # Initialize strategy if enabled
+    strategy_integration = None
+    use_strategy = CONFIG.get("use_strategy", False)
+    if use_strategy:
+        from src.strategies.strategy_integration import StrategyIntegration
+        strategy_config = {
+            "fast_ema_period": CONFIG.get("trader_xo_fast_ema", 12),
+            "slow_ema_period": CONFIG.get("trader_xo_slow_ema", 25),
+            "ma_filter_period": CONFIG.get("trader_xo_ma_filter_period", 200),
+            "ma_filter_type": CONFIG.get("trader_xo_ma_filter_type", "EMA"),
+            "stop_loss_percent": CONFIG.get("trader_xo_stop_loss_percent", 7.0),
+            "use_stop_loss": CONFIG.get("trader_xo_use_stop_loss", True),
+            "use_stoch_confirmation": CONFIG.get("trader_xo_use_stoch_confirmation", False),
+        }
+        strategy_integration = StrategyIntegration(
+            strategy_name=CONFIG.get("strategy_name", "trader_xo"),
+            strategy_config=strategy_config
+        )
+        strategy_mode = CONFIG.get("strategy_mode", "standalone")
+        logging.info(f"Strategy enabled: {CONFIG.get('strategy_name')} in {strategy_mode} mode")
+
 
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
@@ -293,54 +314,197 @@ def main():
                     add_event(f"Data gather error {asset}: {e}")
                     continue
 
-            # Single LLM call with all assets
-            context = (
-                f"## Invocation\n"
-                f"It has been {minutes_since_start:.0f} minutes since you started trading. "
-                f"The current time is {datetime.now(timezone.utc).isoformat()} and you've been invoked {invocation_count} times.\n\n"
-                f"## Market Data\n{all_market_data}\n"
-                f"## Account Information & Performance\n{account_info}\n"
-                f"## Instructions\nDecide actions for ALL assets: {', '.join(args.assets)}. Output a STRICT JSON array only.\n"
-            )
-            add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
-            with open("prompts.log", "a") as f:
-                f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{context}\n")
+            # Decision making: use strategy or LLM based on configuration
+            if use_strategy and strategy_integration:
+                strategy_mode = CONFIG.get("strategy_mode", "standalone")
 
-            def _is_failed_outputs(outs):
-                if not outs:
-                    return True
-                try:
-                    return all(isinstance(o, dict) and (o.get('action') == 'hold') and ('parse error' in (o.get('rationale','').lower())) for o in outs)
-                except Exception:
-                    return True
+                if strategy_mode == "standalone":
+                    # Use strategy only
+                    add_event(f"Using {CONFIG.get('strategy_name')} strategy in standalone mode")
 
-            try:
-                outputs = agent.decide_trade(args.assets, context)
-                if not isinstance(outputs, list):
-                    add_event(f"Invalid output format (expected list): {outputs}")
-                    outputs = []
-            except Exception as e:
-                import traceback
-                add_event(f"Agent error: {e}")
-                add_event(f"Traceback: {traceback.format_exc()}")
-                outputs = []
+                    # Prepare market data for strategy
+                    strategy_market_data = {}
+                    for asset in args.assets:
+                        if asset in asset_prices:
+                            # Fetch price history from TAAPI or use cached perp mids
+                            price_list = []
+                            if asset in price_history and len(price_history[asset]) > 0:
+                                # Use perp mid prices (authoritative)
+                                price_list = [float(p["mid"]) for p in price_history[asset]]
 
-            # Retry once on failure/parse error with a stricter instruction prefix
-            if _is_failed_outputs(outputs):
-                add_event("Retrying LLM once due to invalid/parse-error output")
-                context_retry = (
-                    "## Retry Instruction\nReturn ONLY the JSON array per schema with no prose.\n\n" + context
+                            # Need more historical data for EMAs, fetch from TAAPI
+                            try:
+                                # Get enough candles for 200-period MA filter
+                                candles = taapi.fetch_series(
+                                    "candles",
+                                    f"{asset}/USDT",
+                                    args.interval,
+                                    results=250,
+                                    value_key="close"
+                                )
+                                if candles and len(candles) > 0:
+                                    price_list = candles
+                            except Exception as e:
+                                logging.warning(f"Could not fetch candles for {asset}: {e}")
+
+                            strategy_market_data[asset] = {
+                                "current_price": asset_prices[asset],
+                                "price_history": price_list
+                            }
+
+                    # Generate decisions using strategy
+                    outputs = strategy_integration.generate_trade_decisions(
+                        assets=args.assets,
+                        market_data=strategy_market_data,
+                        taapi_client=taapi,
+                        interval=args.interval
+                    )
+
+                    # Set allocation based on available cash (equally split or by signal strength)
+                    for output in outputs:
+                        if output.get("action") in ("buy", "sell"):
+                            # Simple equal allocation across active signals
+                            active_signals = sum(1 for o in outputs if o.get("action") in ("buy", "sell"))
+                            if active_signals > 0:
+                                output["allocation_usd"] = state['balance'] / active_signals * 0.9  # Use 90% of available
+
+                elif strategy_mode == "hybrid":
+                    # Use strategy indicators to enhance LLM context
+                    add_event(f"Using {CONFIG.get('strategy_name')} strategy in hybrid mode with LLM")
+
+                    # Add strategy context to market data
+                    strategy_context = "\n## Trader XO Strategy Signals\n"
+                    for asset in args.assets:
+                        if asset in asset_prices:
+                            price_list = []
+                            if asset in price_history and len(price_history[asset]) > 0:
+                                price_list = [float(p["mid"]) for p in price_history[asset]]
+
+                            try:
+                                candles = taapi.fetch_series(
+                                    "candles",
+                                    f"{asset}/USDT",
+                                    args.interval,
+                                    results=250,
+                                    value_key="close"
+                                )
+                                if candles and len(candles) > 0:
+                                    price_list = candles
+                            except Exception:
+                                pass
+
+                            if price_list:
+                                analysis = strategy_integration.strategy.analyze(
+                                    asset=asset,
+                                    current_price=asset_prices[asset],
+                                    prices=price_list,
+                                    taapi_client=taapi,
+                                    interval=args.interval
+                                )
+                                strategy_context += f"\n{asset}:\n"
+                                strategy_context += f"  Signal: {analysis.get('signal', 'N/A').upper()}\n"
+                                strategy_context += f"  Rationale: {analysis.get('rationale', 'N/A')}\n"
+                                if analysis.get('fast_ema'):
+                                    strategy_context += f"  Fast EMA: {analysis['fast_ema']:.2f}, Slow EMA: {analysis.get('slow_ema', 0):.2f}\n"
+
+                    # Add to LLM context
+                    context = (
+                        f"## Invocation\n"
+                        f"It has been {minutes_since_start:.0f} minutes since you started trading. "
+                        f"The current time is {datetime.now(timezone.utc).isoformat()} and you've been invoked {invocation_count} times.\n\n"
+                        f"## Market Data\n{all_market_data}\n"
+                        f"{strategy_context}\n"
+                        f"## Account Information & Performance\n{account_info}\n"
+                        f"## Instructions\nDecide actions for ALL assets: {', '.join(args.assets)}. Output a STRICT JSON array only.\n"
+                    )
+                    add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
+                    with open("prompts.log", "a") as f:
+                        f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{context}\n")
+
+                    def _is_failed_outputs(outs):
+                        if not outs:
+                            return True
+                        try:
+                            return all(isinstance(o, dict) and (o.get('action') == 'hold') and ('parse error' in (o.get('rationale','').lower())) for o in outs)
+                        except Exception:
+                            return True
+
+                    try:
+                        outputs = agent.decide_trade(args.assets, context)
+                        if not isinstance(outputs, list):
+                            add_event(f"Invalid output format (expected list): {outputs}")
+                            outputs = []
+                    except Exception as e:
+                        import traceback
+                        add_event(f"Agent error: {e}")
+                        add_event(f"Traceback: {traceback.format_exc()}")
+                        outputs = []
+
+                    # Retry once on failure/parse error with a stricter instruction prefix
+                    if _is_failed_outputs(outputs):
+                        add_event("Retrying LLM once due to invalid/parse-error output")
+                        context_retry = (
+                            "## Retry Instruction\nReturn ONLY the JSON array per schema with no prose.\n\n" + context
+                        )
+                        try:
+                            outputs = agent.decide_trade(args.assets, context_retry)
+                            if not isinstance(outputs, list):
+                                add_event(f"Retry invalid format: {outputs}")
+                                outputs = []
+                        except Exception as e:
+                            import traceback
+                            add_event(f"Retry agent error: {e}")
+                            add_event(f"Retry traceback: {traceback.format_exc()}")
+                            outputs = []
+            else:
+                # Original LLM-only mode
+                context = (
+                    f"## Invocation\n"
+                    f"It has been {minutes_since_start:.0f} minutes since you started trading. "
+                    f"The current time is {datetime.now(timezone.utc).isoformat()} and you've been invoked {invocation_count} times.\n\n"
+                    f"## Market Data\n{all_market_data}\n"
+                    f"## Account Information & Performance\n{account_info}\n"
+                    f"## Instructions\nDecide actions for ALL assets: {', '.join(args.assets)}. Output a STRICT JSON array only.\n"
                 )
+                add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
+                with open("prompts.log", "a") as f:
+                    f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{context}\n")
+
+                def _is_failed_outputs(outs):
+                    if not outs:
+                        return True
+                    try:
+                        return all(isinstance(o, dict) and (o.get('action') == 'hold') and ('parse error' in (o.get('rationale','').lower())) for o in outs)
+                    except Exception:
+                        return True
+
                 try:
-                    outputs = agent.decide_trade(args.assets, context_retry)
+                    outputs = agent.decide_trade(args.assets, context)
                     if not isinstance(outputs, list):
-                        add_event(f"Retry invalid format: {outputs}")
+                        add_event(f"Invalid output format (expected list): {outputs}")
                         outputs = []
                 except Exception as e:
                     import traceback
-                    add_event(f"Retry agent error: {e}")
-                    add_event(f"Retry traceback: {traceback.format_exc()}")
+                    add_event(f"Agent error: {e}")
+                    add_event(f"Traceback: {traceback.format_exc()}")
                     outputs = []
+
+                # Retry once on failure/parse error with a stricter instruction prefix
+                if _is_failed_outputs(outputs):
+                    add_event("Retrying LLM once due to invalid/parse-error output")
+                    context_retry = (
+                        "## Retry Instruction\nReturn ONLY the JSON array per schema with no prose.\n\n" + context
+                    )
+                    try:
+                        outputs = agent.decide_trade(args.assets, context_retry)
+                        if not isinstance(outputs, list):
+                            add_event(f"Retry invalid format: {outputs}")
+                            outputs = []
+                    except Exception as e:
+                        import traceback
+                        add_event(f"Retry agent error: {e}")
+                        add_event(f"Retry traceback: {traceback.format_exc()}")
+                        outputs = []
 
             # Execute trades for each asset
             for output in outputs:
